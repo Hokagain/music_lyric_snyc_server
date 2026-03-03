@@ -18,6 +18,7 @@ namespace music_lyric_snyc_server.ViewModels;
 public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 {
     private const int MaxLogEntries = 400;
+    private static readonly TimeSpan LyricAdvance = TimeSpan.FromMilliseconds(200);
 
     private readonly SmtcService _smtcService;
     private readonly QqMusicApiClient _qqMusicApiClient;
@@ -28,7 +29,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private CancellationTokenSource? _lyricCts;
     private string _currentTrackKey = string.Empty;
     private int _lastLoggedLyricIndex = -1;
-    private DateTime _lastPlaybackInfoLogAt = DateTime.MinValue;
+    private string _lastPlaybackInfoSummary = string.Empty;
+    private int _lyricLoadVersion = 0;
 
     public ObservableCollection<LyricLine> LyricLines { get; } = [];
     public ObservableCollection<LogEntry> LogEntries { get; } = [];
@@ -195,13 +197,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         SongTitle = string.IsNullOrWhiteSpace(snapshot.Title) ? "未检测到 QQ 音乐播放" : snapshot.Title;
         Artist = snapshot.Artist;
         PlaybackStatus = snapshot.IsPlaying ? "Playing" : "Paused";
-        var now = DateTime.Now;
-        if ((now - _lastPlaybackInfoLogAt).TotalSeconds >= 1)
+        var playbackSummary = $"标题='{SongTitle}', 歌手='{Artist}', 状态={PlaybackStatus}";
+        if (!string.Equals(playbackSummary, _lastPlaybackInfoSummary, StringComparison.Ordinal))
         {
-            _lastPlaybackInfoLogAt = now;
-            await AddLogAsync(
-                "INFO",
-                $"播放状态更新: 标题='{SongTitle}', 歌手='{Artist}', 状态={PlaybackStatus}, 进度={snapshot.Position:mm\\:ss}/{snapshot.Duration:mm\\:ss}");
+            _lastPlaybackInfoSummary = playbackSummary;
+            await AddLogAsync("INFO", $"播放状态更新: {playbackSummary}");
         }
 
         UpdateProgress(snapshot.Position, snapshot.Duration);
@@ -210,15 +210,24 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         if (snapshot.ThumbnailBytes is { Length: > 0 })
         {
             CoverImage = ToBitmapImage(snapshot.ThumbnailBytes);
-            await AddLogAsync("DEBUG", $"封面已更新，字节数={snapshot.ThumbnailBytes.Length}");
         }
+        else if (!string.IsNullOrWhiteSpace(snapshot.Title))
+        {
+            CoverImage = null;
+        }
+
 
         if (!string.IsNullOrWhiteSpace(snapshot.Title) && snapshot.TrackKey != _currentTrackKey)
         {
             _currentTrackKey = snapshot.TrackKey;
             _lastLoggedLyricIndex = -1;
-            await AddLogAsync("INFO", $"检测到歌曲切换，开始拉取歌词: {snapshot.Title}");
-            await LoadLyricsForTrackAsync(snapshot.Title);
+            _lastPlaybackInfoSummary = string.Empty;
+            _lyricLoadVersion++;
+            LyricLines.Clear();
+            CurrentLyric = "歌词加载中...";
+            CurrentLyricIndex = -1;
+            await AddLogAsync("INFO", $"检测到歌曲切换，开始拉取歌词: {snapshot.Title} - {snapshot.Artist}");
+            await LoadLyricsForTrackAsync(snapshot.Title, snapshot.Artist, _lyricLoadVersion);
         }
 
         if (string.IsNullOrWhiteSpace(snapshot.Title))
@@ -228,35 +237,47 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             CurrentLyric = string.Empty;
             CurrentLyricIndex = -1;
             CoverImage = null;
+            _lyricLoadVersion++;
             await AddLogAsync("WARN", "当前未检测到 QQ 音乐播放。");
         }
     }
 
-    private async Task LoadLyricsForTrackAsync(string title)
+    private async Task LoadLyricsForTrackAsync(string title, string artist, int version)
     {
         _lyricCts?.Cancel();
         _lyricCts?.Dispose();
         _lyricCts = new CancellationTokenSource();
-        await AddLogAsync("DEBUG", $"歌词请求上下文已重置，关键词: {title}");
+        await AddLogAsync("DEBUG", $"歌词请求上下文已重置，关键词: 标题={title}, 歌手={artist}");
 
         try
         {
             var ct = _lyricCts.Token;
-            await AddLogAsync("INFO", $"调用搜索接口获取歌曲 ID: {title}");
-            var songId = await _qqMusicApiClient.SearchFirstSongIdAsync(title, ct);
+            await AddLogAsync("INFO", $"调用搜索接口匹配歌曲+歌手获取 ID: 标题={title}, 歌手={artist}");
+            var songId = await _qqMusicApiClient.SearchSongIdBySongAndSingerAsync(title, artist, ct);
             if (!songId.HasValue)
             {
+                if (version != _lyricLoadVersion)
+                {
+                    return;
+                }
+
                 LyricLines.Clear();
                 CurrentLyric = "未找到歌词";
                 CurrentLyricIndex = -1;
-                await AddLogAsync("WARN", $"未搜索到歌曲 ID: {title}");
+                await AddLogAsync("WARN", $"未匹配到歌曲 ID: 标题={title}, 歌手={artist}");
                 return;
             }
 
-            await AddLogAsync("INFO", $"搜索成功，歌曲 ID={songId.Value}，开始请求歌词。");
+            await AddLogAsync("INFO", $"匹配成功，歌曲 ID={songId.Value}，开始请求歌词。");
             var lrc = await _qqMusicApiClient.GetLyricBySongIdAsync(songId.Value, ct);
             await AddLogAsync("DEBUG", $"歌词接口返回长度={(lrc?.Length ?? 0)} 字符。");
             var parsed = _lyricParser.Parse(lrc);
+
+            if (version != _lyricLoadVersion)
+            {
+                await AddLogAsync("DEBUG", $"歌词回包已过期，丢弃: {title}");
+                return;
+            }
 
             LyricLines.Clear();
             foreach (var line in parsed)
@@ -288,7 +309,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             return;
         }
 
-        var index = _lyricParser.GetCurrentLineIndex(LyricLines, position);
+        var adjustedPosition = position + LyricAdvance;
+        var index = _lyricParser.GetCurrentLineIndex(LyricLines, adjustedPosition);
         CurrentLyricIndex = index;
         CurrentLyric = index >= 0 ? LyricLines[index].Text : string.Empty;
         if (index >= 0 && index != _lastLoggedLyricIndex)

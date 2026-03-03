@@ -11,7 +11,7 @@ public sealed class QqMusicApiClient
 {
     private static readonly HttpClient HttpClient = new();
 
-    public async Task<long?> SearchFirstSongIdAsync(string songName, CancellationToken cancellationToken)
+    public async Task<long?> SearchSongIdBySongAndSingerAsync(string songName, string singerName, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(songName))
         {
@@ -36,23 +36,39 @@ public sealed class QqMusicApiClient
             return null;
         }
 
-        var firstSong = dataElement.EnumerateArray().FirstOrDefault();
-        if (firstSong.ValueKind == JsonValueKind.Undefined)
+        var candidates = dataElement
+            .EnumerateArray()
+            .Select(ParseCandidate)
+            .Where(x => x.Id.HasValue && !string.IsNullOrWhiteSpace(x.Song))
+            .ToList();
+
+        if (candidates.Count == 0)
         {
             return null;
         }
 
-        if (!firstSong.TryGetProperty("id", out var idElement))
+        var normalizedTitle = Normalize(songName);
+        var normalizedSinger = Normalize(singerName);
+
+        var titleMatched = candidates
+            .Where(x => Normalize(x.Song) == normalizedTitle)
+            .ToList();
+
+        var singerMatched = titleMatched
+            .FirstOrDefault(x => IsSingerMatch(normalizedSinger, Normalize(x.Singer)));
+
+        if (singerMatched.Id.HasValue)
         {
-            return null;
+            return singerMatched.Id.Value;
         }
 
-        return idElement.ValueKind switch
+        var firstTitleMatched = titleMatched.FirstOrDefault();
+        if (firstTitleMatched.Id.HasValue)
         {
-            JsonValueKind.Number => idElement.GetInt64(),
-            JsonValueKind.String when long.TryParse(idElement.GetString(), out var parsed) => parsed,
-            _ => null
-        };
+            return firstTitleMatched.Id.Value;
+        }
+
+        return candidates[0].Id;
     }
 
     public async Task<string?> GetLyricBySongIdAsync(long songId, CancellationToken cancellationToken)
@@ -85,5 +101,52 @@ public sealed class QqMusicApiClient
         }
 
         return null;
+    }
+
+    private static (long? Id, string Song, string Singer) ParseCandidate(JsonElement element)
+    {
+        long? id = null;
+        if (element.TryGetProperty("id", out var idElement))
+        {
+            id = idElement.ValueKind switch
+            {
+                JsonValueKind.Number => idElement.GetInt64(),
+                JsonValueKind.String when long.TryParse(idElement.GetString(), out var parsed) => parsed,
+                _ => null
+            };
+        }
+
+        var song = element.TryGetProperty("song", out var songElement) ? songElement.GetString() ?? string.Empty : string.Empty;
+        var singer = element.TryGetProperty("singer", out var singerElement) ? singerElement.GetString() ?? string.Empty : string.Empty;
+        return (id, song, singer);
+    }
+
+    private static bool IsSingerMatch(string expectedSinger, string candidateSinger)
+    {
+        if (string.IsNullOrWhiteSpace(expectedSinger))
+        {
+            return false;
+        }
+
+        if (candidateSinger == expectedSinger)
+        {
+            return true;
+        }
+
+        return candidateSinger.Contains(expectedSinger, StringComparison.Ordinal) ||
+               expectedSinger.Contains(candidateSinger, StringComparison.Ordinal);
+    }
+
+    private static string Normalize(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var chars = value
+            .Where(c => !char.IsWhiteSpace(c) && c != '/' && c != '、' && c != '&' && c != ',' && c != '，')
+            .ToArray();
+        return new string(chars).Trim().ToLowerInvariant();
     }
 }
