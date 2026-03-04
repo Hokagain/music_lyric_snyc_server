@@ -12,7 +12,11 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _viewModel = new MainViewModel(new SmtcService(), new QqMusicApiClient(), new LyricParser());
+        _viewModel = new MainViewModel(
+            new SmtcService(),
+            new QqMusicApiClient(),
+            new LyricParser(),
+            new LyricSocketServerService());
         DataContext = _viewModel;
 
         Loaded += OnLoaded;

@@ -23,6 +23,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private readonly SmtcService _smtcService;
     private readonly QqMusicApiClient _qqMusicApiClient;
     private readonly LyricParser _lyricParser;
+    private readonly LyricSocketServerService _lyricSocketServerService;
     private readonly DispatcherTimer _progressTimer;
     private readonly Dispatcher _uiDispatcher;
 
@@ -31,6 +32,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private int _lastLoggedLyricIndex = -1;
     private string _lastPlaybackInfoSummary = string.Empty;
     private int _lyricLoadVersion = 0;
+    private long _positionMs;
+    private long _durationMs;
 
     public ObservableCollection<LyricLine> LyricLines { get; } = [];
     public ObservableCollection<LogEntry> LogEntries { get; } = [];
@@ -140,11 +143,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public MainViewModel(SmtcService smtcService, QqMusicApiClient qqMusicApiClient, LyricParser lyricParser)
+    public MainViewModel(
+        SmtcService smtcService,
+        QqMusicApiClient qqMusicApiClient,
+        LyricParser lyricParser,
+        LyricSocketServerService lyricSocketServerService)
     {
         _smtcService = smtcService;
         _qqMusicApiClient = qqMusicApiClient;
         _lyricParser = lyricParser;
+        _lyricSocketServerService = lyricSocketServerService;
         _uiDispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
         FilteredLogEntries = CollectionViewSource.GetDefaultView(LogEntries);
         FilteredLogEntries.Filter = FilterLogEntry;
@@ -160,11 +168,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     public async Task StartAsync()
     {
         await AddLogAsync("INFO", "开始初始化 SMTC 监听。");
+        _lyricSocketServerService.LogGenerated += OnSocketLogGenerated;
+        await AddLogAsync("INFO", "开始启动 UDP/TCP 歌词网络服务。");
+        await _lyricSocketServerService.StartAsync();
         _smtcService.PlaybackChanged += OnPlaybackChanged;
         await _smtcService.InitializeAsync();
         await AddLogAsync("INFO", "SMTC 初始化完成，已开始监听 QQ 音乐会话。");
         _progressTimer.Start();
         await AddLogAsync("INFO", "进度定时器已启动，间隔 500ms。");
+        _ = PublishSocketPayloadAsync();
     }
 
     private async void OnProgressTimerTick(object? sender, EventArgs e)
@@ -179,6 +191,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
 
             UpdateProgress(snapshot.Position, snapshot.Duration);
             UpdateCurrentLyric(snapshot.Position);
+            _ = PublishSocketPayloadAsync();
         }
         catch (Exception ex)
         {
@@ -240,6 +253,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             _lyricLoadVersion++;
             await AddLogAsync("WARN", "当前未检测到 QQ 音乐播放。");
         }
+
+        _ = PublishSocketPayloadAsync();
     }
 
     private async Task LoadLyricsForTrackAsync(string title, string artist, int version)
@@ -265,6 +280,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
                 CurrentLyric = "未找到歌词";
                 CurrentLyricIndex = -1;
                 await AddLogAsync("WARN", $"未匹配到歌曲 ID: 标题={title}, 歌手={artist}");
+                _ = PublishSocketPayloadAsync();
                 return;
             }
 
@@ -288,6 +304,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             CurrentLyric = LyricLines.Count > 0 ? LyricLines[0].Text : "未找到歌词";
             CurrentLyricIndex = LyricLines.Count > 0 ? 0 : -1;
             await AddLogAsync("INFO", $"歌词解析完成，行数={LyricLines.Count}");
+            _ = PublishSocketPayloadAsync();
         }
         catch (OperationCanceledException)
         {
@@ -299,6 +316,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
             CurrentLyric = "歌词加载失败";
             CurrentLyricIndex = -1;
             await AddLogAsync("ERROR", $"歌词加载失败: {ex.Message}");
+            _ = PublishSocketPayloadAsync();
         }
     }
 
@@ -323,6 +341,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     private void UpdateProgress(TimeSpan position, TimeSpan duration)
     {
         ProgressText = $"{ToTime(position)} / {ToTime(duration)}";
+        _positionMs = (long)position.TotalMilliseconds;
+        _durationMs = (long)duration.TotalMilliseconds;
     }
 
     private static string ToTime(TimeSpan time)
@@ -367,6 +387,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
         _lyricCts?.Cancel();
         _lyricCts?.Dispose();
         await AddLogAsync("INFO", "歌词同步模块已释放。");
+
+        _lyricSocketServerService.LogGenerated -= OnSocketLogGenerated;
+        await _lyricSocketServerService.DisposeAsync();
     }
 
     private Task AddLogAsync(string level, string message)
@@ -423,5 +446,32 @@ public sealed class MainViewModel : INotifyPropertyChanged, IAsyncDisposable
     {
         LogEntries.Clear();
         SelectedLogEntry = null;
+    }
+
+    private void OnSocketLogGenerated(string level, string message)
+    {
+        _ = AddLogAsync(level, message);
+    }
+
+    private async Task PublishSocketPayloadAsync()
+    {
+        try
+        {
+            var payload = new LyricSocketPayload
+            {
+                Title = SongTitle,
+                Artist = Artist,
+                Status = PlaybackStatus,
+                PositionMs = _positionMs,
+                DurationMs = _durationMs,
+                Lines = CurrentLyric
+            };
+
+            await _lyricSocketServerService.PublishAsync(payload);
+        }
+        catch (Exception ex)
+        {
+            await AddLogAsync("ERROR", $"推送歌词到 TCP 服务失败: {ex.Message}");
+        }
     }
 }
