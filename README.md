@@ -1,4 +1,5 @@
 # music_lyric_snyc_server
+<img width="1890" height="1330" alt="image" src="https://github.com/user-attachments/assets/17f55a6a-3bf6-418d-a27b-4c4d142098c2" />
 
 ## 功能说明
 - 通过 Windows SMTC 监听 QQ 音乐播放状态。
