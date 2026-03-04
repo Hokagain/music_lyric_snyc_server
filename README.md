@@ -40,7 +40,7 @@ dotnet run
 - 获取歌词：
   - `https://api.vkeys.cn/v2/music/tencent/lyric?id=歌曲id`
 - 解析字段：使用 `data.lrc`。
-
+致谢落月api【https://doc.vkeys.cn/】
 ## UDP/TCP 同步协议
 ### 1) UDP 发现（无客户端连接时）
 - 服务监听 UDP 端口：`33332`
